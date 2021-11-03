@@ -1,7 +1,9 @@
-import dataclasses
+import json
 import random
 import socket
 import struct
+import ipaddress
+
 
 
 class DnsServer:
@@ -19,13 +21,21 @@ class DnsServer:
             self.__handle_client__(data, ipaddress)
 
     def __handle_client__(self, data, client):
-        url, r_type = data.split()
-        request = self.request_generator.generate_request(url, r_type)
-        self.server_socket.sendto(request, self.root_server_address)
-        response, server = self.server_socket.recvfrom(1024)
-        parsed_response = self.response_parser.parse_response(response)
-        print(parsed_response)
-        self.server_socket.sendto(response, client)
+        parts = data.split()
+        try:
+            request = self.request_generator.generate_request(parts[0], parts[1])
+            if len(parts) == 2:
+                self.server_socket.sendto(request, self.root_server_address)
+            elif len(parts) == 3:
+                self.server_socket.sendto(request, (parts[2], 53))
+            response, server = self.server_socket.recvfrom(1024)
+            parsed_response = self.response_parser.parse_response(response)
+            json_string = json.dumps(parsed_response)
+            self.server_socket.sendto(json_string.encode(), client)
+        except ValueError or TypeError:
+            self.server_socket.sendto('Refused: check the correctness of the request.'.encode(), client)
+        except IndexError:
+            self.server_socket.sendto('Refused: fewer arguments passed than necessary.'.encode(), client)
 
 
 class DnsRequestGenerator:
@@ -66,17 +76,17 @@ class DnsRequestGenerator:
 
 class DnsResponseParser:
     qtypes = {
-        1: b'A',
-        28: b'AAAA',
-        15: b'MX',
-        2: b'NS'
+        1: 'A',
+        28: 'AAAA',
+        15: 'MX',
+        2: 'NS'
     }
     flags = [('QR', 1), ('Opcode', 4), ('AA', 1), ('TC', 1),
              ('RD', 1), ('RA', 1), ('Z', 3), ('RCODE', 4)]
 
     def parse_response(self, response):
-        result = {'header': self.__parse_header__(response[:12]),
-                  'body': self.__parse_body__(response[12:])}
+        result = {'header': self.__parse_header__(response[:12])}
+        result['body'] = self.__parse_body__(response[12:], result['header'])
         return result
 
     def __parse_header__(self, header):
@@ -92,38 +102,51 @@ class DnsResponseParser:
         result['arcount'] = ar
         return result
 
-    def __parse_body__(self, data):
+    def __parse_body__(self, data, header):
         result = {}
+        sections = {
+            'question': header['qdcount'],
+            'answer': header['ancount'],
+            'authority': header['nscount'],
+            'additional': header['arcount']
+        }
         cursor = 0
-        result['name'], cursor = self.__read_name__(data, cursor)
-        cursor += 1
-        result['type'] = self.qtypes[struct.unpack('>H', data[cursor: cursor + 2])[0]]
-        cursor += 2
-        result['class'] = struct.unpack('>H', data[cursor: cursor + 2])[0]
-        cursor += 2
-        result['records'] = self.__parse_records__(data, cursor)
+        for section in sections:
+            for i in range(sections[section]):
+                if section not in result:
+                    result[section] = []
+                sec, cursor = self.__parse_record__(data, cursor)
+                result[section].append(sec)
         return result
 
-    def __parse_records__(self, data, cursor):
-        records = []
-        while cursor < len(data):
-            record = {}
-            if data[cursor] == 192:
-                start_index = data[cursor + 1] - 12
-                record['name'], _ = self.__read_name__(data, start_index)
-                cursor += 2
-                record['type'] = struct.unpack('>H', data[cursor: cursor + 2])[0]
-                cursor += 2
-                record['class'] = struct.unpack('>H', data[cursor: cursor + 2])[0]
-                cursor += 2
-                record['ttl'] = struct.unpack('>I', data[cursor: cursor + 4])[0]
-                cursor += 4
-                size = struct.unpack('>H', data[cursor: cursor + 2])[0]
-                cursor += 2
-                record['data'] = self.__parse_data__(data, cursor, size, record['type'])
-                cursor += size
-                records.append(record)
-        return records
+    def __get_question_section__(self, data, cursor):
+        section = {}
+        section['name'], cursor = self.__read_name__(data, cursor)
+        cursor += 1
+        section['type'] = self.qtypes[struct.unpack('>H', data[cursor: cursor + 2])[0]]
+        cursor += 2
+        section['class'] = struct.unpack('>H', data[cursor: cursor + 2])[0]
+        cursor += 2
+        return section, cursor
+
+    def __parse_record__(self, data: bytes, cursor: int):
+        record = {}
+        if data[cursor] == 192:
+            start_index = data[cursor + 1] - 12
+            record['name'], _ = self.__read_name__(data, start_index)
+            cursor += 2
+            record['type'] = struct.unpack('>H', data[cursor: cursor + 2])[0]
+            cursor += 2
+            record['class'] = struct.unpack('>H', data[cursor: cursor + 2])[0]
+            cursor += 2
+            record['ttl'] = struct.unpack('>I', data[cursor: cursor + 4])[0]
+            cursor += 4
+            size = struct.unpack('>H', data[cursor: cursor + 2])[0]
+            cursor += 2
+            record['data'] = self.__parse_data__(data, cursor, size, record['type'])
+            cursor += size
+            return record, cursor
+        return self.__get_question_section__(data, cursor)
 
     def __read_name__(self, data, cursor, size=0):
         name = []
@@ -142,16 +165,15 @@ class DnsResponseParser:
         return '.'.join(name), cursor
 
     def __parse_ip__(self, data, cursor, size):
-        ip = []
-        for i in range(size):
-            ip.append(str(data[cursor + i]))
-        return '.'.join(ip)
+        return str(ipaddress.IPv4Address(data[cursor: cursor + size]))
 
     def __parse_ipv6__(self, data, cursor, size):
-        ip = []
-        for i in range(cursor, cursor + size, 2):
-            ip.append(data[i: i + 2])
-        return b':'.join(ip)
+        return str(ipaddress.IPv6Address(data[cursor: cursor + size]))
+
+    def __parse_mx__(self, data, cursor, size):
+        preference = struct.unpack('>H', data[cursor: cursor + 2])[0]
+        mail_exchange, _ = self.__read_name__(data, cursor + 2, size - 2)
+        return ' '.join([str(preference), mail_exchange])
 
     def __parse_data__(self, data, cursor, size, type_code):
         if type_code == 2:
@@ -160,3 +182,5 @@ class DnsResponseParser:
             return self.__parse_ip__(data, cursor, size)
         elif type_code == 28:
             return self.__parse_ipv6__(data, cursor, size)
+        elif type_code == 15:
+            return self.__parse_mx__(data, cursor, size)
