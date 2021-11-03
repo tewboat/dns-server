@@ -1,5 +1,10 @@
 from dns_server import DnsServer
 
-if __name__ == '__main__':
+
+def main():
     server = DnsServer("192.168.0.148", 53)
     server.run()
+
+
+if __name__ == '__main__':
+    main()

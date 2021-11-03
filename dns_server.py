@@ -3,26 +3,35 @@ import random
 import socket
 import struct
 import ipaddress
-
+import time
+import atexit
+from queue import Queue
 
 
 class DnsServer:
     root_server_address = ('198.41.0.4', 53)
 
-    def __init__(self, host, port):
+    def __init__(self, host, port, cash_size=10):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.server_socket.bind((host, port))
         self.request_generator = DnsRequestGenerator()
         self.response_parser = DnsResponseParser()
+        self.cash = Cash(cash_size)
+        atexit.register(self.cash.save)
 
     def run(self):
         while True:
-            data, ipaddress = self.server_socket.recvfrom(256)
-            self.__handle_client__(data, ipaddress)
+            data, address = self.server_socket.recvfrom(256)
+            self.__handle_client__(data, address)
 
     def __handle_client__(self, data, client):
-        parts = data.split()
+        parts = tuple(data.split())
+        data = b' '.join(parts).decode()
         try:
+            if data in self.cash:
+                json_string = json.dumps(self.cash.get(data))
+                self.server_socket.sendto(json_string.encode(), client)
+                return
             request = self.request_generator.generate_request(parts[0], parts[1])
             if len(parts) == 2:
                 self.server_socket.sendto(request, self.root_server_address)
@@ -31,6 +40,7 @@ class DnsServer:
             response, server = self.server_socket.recvfrom(1024)
             parsed_response = self.response_parser.parse_response(response)
             json_string = json.dumps(parsed_response)
+            self.cash.put(data, parsed_response)
             self.server_socket.sendto(json_string.encode(), client)
         except ValueError or TypeError:
             self.server_socket.sendto('Refused: check the correctness of the request.'.encode(), client)
@@ -184,3 +194,90 @@ class DnsResponseParser:
             return self.__parse_ipv6__(data, cursor, size)
         elif type_code == 15:
             return self.__parse_mx__(data, cursor, size)
+
+
+class CashRecord:
+    def __init__(self, request, response, let):
+        self.request = request
+        self.response = response
+        self.let = let
+        self.r = True
+
+    def to_dict(self):
+        return {'response': self.response, 'let': self.let, 'r': self.r}
+
+
+class Cash:
+    def __init__(self, maxsize=100):
+        self.queue = Queue(maxsize=maxsize)
+        self.records = {}
+        try:
+            self.restore()
+        except FileNotFoundError:
+            pass
+
+    def get(self, key):
+        if not key or key not in self.records:
+            return None
+        record = self.records[key]
+        record.r = True
+        return record.response
+
+    def put(self, request, response):
+        if self.queue.maxsize == 0:
+            return
+        while self.queue.full():
+            record = self.queue.get()
+            if record.r and record.let > time.time():
+                record.r = False
+                self.queue.put(record)
+            else:
+                self.records.pop(record.request)
+        record = CashRecord(request, response, self.__get_ttl__(response) + time.time())
+        self.records[request] = record
+        self.queue.put(record)
+
+    def restore(self):
+        with open('cash.json', 'r+') as file:
+            data = file.read()
+            dict = json.loads(data)
+            for request in dict:
+                record = CashRecord(request, dict[request]['response'], dict[request]['let'])
+                record.r = dict[request]['r']
+                if record.let < time.time():
+                    continue
+                self.records[request] = record
+                self.queue.put(record)
+
+    def save(self):
+        dict = {}
+        for record in self.records:
+            dict[record] = self.records[record].to_dict()
+
+        with open('cash.json', 'w+') as file:
+            file.write(json.dumps(dict))
+
+    def __contains__(self, item):
+        if item not in self.records:
+            return False
+        if self.records[item].let < time.time():
+            self.records.pop(item)
+            return False
+        return True
+
+    def __get_ttl__(self, response):
+        sections = [
+            'answer',
+            'authority',
+            'additional'
+        ]
+        ttl = 0
+        for section in sections:
+            if section not in response['body']:
+                continue
+            for record in response['body'][section]:
+                if ttl == 0:
+                    ttl = record['ttl']
+                elif ttl > record['ttl']:
+                    ttl = record['ttl']
+        return ttl
