@@ -1,11 +1,13 @@
+import atexit
+import ipaddress
 import json
 import random
 import socket
 import struct
-import ipaddress
 import time
-import atexit
 from queue import Queue
+from threading import Thread, Lock
+import selectors
 
 
 class DnsServer:
@@ -14,46 +16,63 @@ class DnsServer:
     def __init__(self, host, port, cash_size=10):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.server_socket.bind((host, port))
+        self.request_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.request_generator = DnsRequestGenerator()
         self.response_parser = DnsResponseParser()
         self.cash = Cash(cash_size)
         atexit.register(self.cash.save)
 
     def run(self):
+
         while True:
             data, address = self.server_socket.recvfrom(256)
-            self.__handle_client__(data, address)
+            Thread(target=self.__handle_client__, args=(data, address)).start()
 
     def __handle_client__(self, data, client):
+        data = data.decode()
         parts = tuple(data.split())
-        data = b' '.join(parts).decode()
         try:
             if data in self.cash:
                 json_string = json.dumps(self.cash.get(data))
                 self.server_socket.sendto(json_string.encode(), client)
                 return
-            request = self.request_generator.generate_request(parts[0], parts[1])
-            if len(parts) == 2:
-                self.server_socket.sendto(request, self.root_server_address)
-            elif len(parts) == 3:
-                self.server_socket.sendto(request, (parts[2], 53))
-            response, server = self.server_socket.recvfrom(1024)
-            parsed_response = self.response_parser.parse_response(response)
-            json_string = json.dumps(parsed_response)
-            self.cash.put(data, parsed_response)
+
+            answer = self.__get_answer__(parts[0], parts[1], self.root_server_address)
+            json_string = json.dumps(answer)
+            self.cash.put(data, answer)
             self.server_socket.sendto(json_string.encode(), client)
+
         except ValueError or TypeError:
             self.server_socket.sendto('Refused: check the correctness of the request.'.encode(), client)
         except IndexError:
             self.server_socket.sendto('Refused: fewer arguments passed than necessary.'.encode(), client)
 
+    def __get_answer__(self, url, type, target):
+        while True:
+            parsed_response = self.__get_dns_response(url, type, target)
+            body = parsed_response['body']
+            if 'answer' in body:
+                break
+            if 'additional' in body:
+                target = (body['additional'][0]['data'], 53)
+            else:
+                target = (
+                    self.__get_answer__(body['authority'][0]['data'], 'A', self.root_server_address)[0]['data'], 53)
+        return body['answer']
+
+    def __get_dns_response(self, url, type, target):
+        request = self.request_generator.generate_request(url, type)
+        self.request_socket.sendto(request, target)
+        response, server = self.request_socket.recvfrom(10000)
+        return self.response_parser.parse_response(response)
+
 
 class DnsRequestGenerator:
     qtypes = {
-        b'A': 1,
-        b'AAAA': 28,
-        b'MX': 15,
-        b'NS': 2
+        'A': 1,
+        'AAAA': 28,
+        'MX': 15,
+        'NS': 2
     }
 
     def generate_request(self, url, r_type):
@@ -74,10 +93,10 @@ class DnsRequestGenerator:
         if r_type not in self.qtypes:
             raise ValueError(f'Incorrect request type: {r_type}')
         body = []
-        labels = url.split(b'.')
+        labels = url.split('.')
         for label in labels:
             body.append(struct.pack('>B', len(label)))
-            body.append(label)
+            body.append(label.encode())
         body.append(struct.pack('>B', 0))
         body.append(struct.pack('>H', self.qtypes[r_type]))
         body.append(struct.pack('>H', 1))
@@ -211,19 +230,23 @@ class Cash:
     def __init__(self, maxsize=100):
         self.queue = Queue(maxsize=maxsize)
         self.records = {}
+        self.lock = Lock()
         try:
             self.restore()
         except FileNotFoundError:
             pass
 
     def get(self, key):
+        self.lock.acquire()
         if not key or key not in self.records:
             return None
         record = self.records[key]
         record.r = True
+        self.lock.release()
         return record.response
 
     def put(self, request, response):
+        self.lock.acquire()
         if self.queue.maxsize == 0:
             return
         while self.queue.full():
@@ -236,6 +259,7 @@ class Cash:
         record = CashRecord(request, response, self.__get_ttl__(response) + time.time())
         self.records[request] = record
         self.queue.put(record)
+        self.lock.release()
 
     def restore(self):
         with open('cash.json', 'r+') as file:
@@ -266,18 +290,4 @@ class Cash:
         return True
 
     def __get_ttl__(self, response):
-        sections = [
-            'answer',
-            'authority',
-            'additional'
-        ]
-        ttl = 0
-        for section in sections:
-            if section not in response['body']:
-                continue
-            for record in response['body'][section]:
-                if ttl == 0:
-                    ttl = record['ttl']
-                elif ttl > record['ttl']:
-                    ttl = record['ttl']
-        return ttl
+        return response[0]['ttl']
