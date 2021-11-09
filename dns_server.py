@@ -5,9 +5,10 @@ import random
 import socket
 import struct
 import time
+import socketserver
 from queue import Queue
 from threading import Thread, Lock
-import selectors
+
 
 
 class DnsServer:
@@ -20,51 +21,51 @@ class DnsServer:
         self.request_generator = DnsRequestGenerator()
         self.response_parser = DnsResponseParser()
         self.cash = Cash(cash_size)
-        atexit.register(self.cash.save)
+        atexit.register(self.__shut_down__)
 
     def run(self):
 
         while True:
-            data, address = self.server_socket.recvfrom(256)
+            data, address = self.server_socket.recvfrom(1024)
+            print(address)
             Thread(target=self.__handle_client__, args=(data, address)).start()
 
     def __handle_client__(self, data, client):
-        data = data.decode()
-        parts = tuple(data.split())
-        try:
-            if data in self.cash:
-                json_string = json.dumps(self.cash.get(data))
-                self.server_socket.sendto(json_string.encode(), client)
-                return
+        if data in self.cash:
+            self.server_socket.sendto(self.cash.get(data), client)
+            return
 
-            answer = self.__get_answer__(parts[0], parts[1], self.root_server_address)
-            json_string = json.dumps(answer)
-            self.cash.put(data, answer)
-            self.server_socket.sendto(json_string.encode(), client)
+        parsed_answer, raw_answer = self.__get_answer__(data, self.root_server_address)
+        self.cash.put(data, raw_answer, parsed_answer['body']['answer'][0]['ttl'])
+        self.server_socket.sendto(raw_answer, client)
 
-        except ValueError or TypeError:
-            self.server_socket.sendto('Refused: check the correctness of the request.'.encode(), client)
-        except IndexError:
-            self.server_socket.sendto('Refused: fewer arguments passed than necessary.'.encode(), client)
-
-    def __get_answer__(self, url, type, target):
+    def __get_answer__(self, request, target):
         while True:
-            parsed_response = self.__get_dns_response(url, type, target)
+            self.request_socket.sendto(request, target)
+            raw_response, server = self.request_socket.recvfrom(10000)
+            parsed_response = self.response_parser.parse_response(raw_response)
             body = parsed_response['body']
             if 'answer' in body:
                 break
             if 'additional' in body:
-                target = (body['additional'][0]['data'], 53)
+                for record in body['additional']:
+                    if record['type'] == 1:
+                        target = (record['data'], 53)
             else:
                 target = (
-                    self.__get_answer__(body['authority'][0]['data'], 'A', self.root_server_address)[0]['data'], 53)
-        return body['answer']
+                    self.__get_answer__(
+                        self.request_generator.generate_request(body['authority'][0]['data'], 'A'),
+                        self.root_server_address)[0]['body']['answer'][0]['data'], 53)
+        return parsed_response, raw_response
 
-    def __get_dns_response(self, url, type, target):
-        request = self.request_generator.generate_request(url, type)
-        self.request_socket.sendto(request, target)
-        response, server = self.request_socket.recvfrom(10000)
-        return self.response_parser.parse_response(response)
+    def __shut_down__(self):
+        self.server_socket.close()
+        self.request_socket.close()
+
+
+class DnsRequestHandler(socketserver.DatagramRequestHandler):
+    def handle(self) -> None:
+        pass
 
 
 class DnsRequestGenerator:
@@ -235,6 +236,7 @@ class Cash:
             self.restore()
         except FileNotFoundError:
             pass
+        atexit.register(self.save)
 
     def get(self, key):
         self.lock.acquire()
@@ -245,7 +247,7 @@ class Cash:
         self.lock.release()
         return record.response
 
-    def put(self, request, response):
+    def put(self, request, response, ttl):
         self.lock.acquire()
         if self.queue.maxsize == 0:
             return
@@ -256,7 +258,7 @@ class Cash:
                 self.queue.put(record)
             else:
                 self.records.pop(record.request)
-        record = CashRecord(request, response, self.__get_ttl__(response) + time.time())
+        record = CashRecord(request, response, ttl + time.time())
         self.records[request] = record
         self.queue.put(record)
         self.lock.release()
@@ -288,6 +290,3 @@ class Cash:
             self.records.pop(item)
             return False
         return True
-
-    def __get_ttl__(self, response):
-        return response[0]['ttl']
