@@ -3,61 +3,89 @@ import ipaddress
 import json
 import random
 import socket
+import socketserver
 import struct
 import time
 from queue import Queue
-from threading import Thread, Lock
+from threading import Lock
 
 
-class DnsServer:
-    root_server_address = ('198.41.0.4', 53)
+class CashRecord:
+    def __init__(self, request: str, response: str, let: float):
+        self.request = request
+        self.response = response
+        self.let = let
+        self.r = True
 
-    def __init__(self, host, port, cash_size=10):
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.server_socket.bind((host, port))
-        self.request_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.request_generator = DnsRequestGenerator()
-        self.response_parser = DnsResponseParser()
-        self.cash = Cash(cash_size)
-        atexit.register(self.__shut_down__)
+    def to_dict(self):
+        return {'response': self.response, 'let': self.let, 'r': self.r}
 
-    def run(self):
-        while True:
-            data, address = self.server_socket.recvfrom(1024)
-            Thread(target=self.__handle_client__, args=(data, address)).start()
 
-    def __handle_client__(self, data, client):
-        if data in self.cash:
-            self.server_socket.sendto(self.cash.get(data), client)
+class Cash:
+    def __init__(self, maxsize=100):
+        self.queue = Queue(maxsize=maxsize)
+        self.records = {}
+        self.lock = Lock()
+        try:
+            self.restore()
+        except FileNotFoundError:
+            pass
+        atexit.register(self.save)
+
+    def get(self, key):
+        self.lock.acquire()
+        if not key or key not in self.records:
+            return None
+        record = self.records[key]
+        record.r = True
+        self.lock.release()
+        return record.response.decode()
+
+    def put(self, request: bytes, response: bytes, ttl: float):
+        request = request.decode(errors='ignore')
+        response = response.decode(errors='ignore')
+        self.lock.acquire()
+        if self.queue.maxsize == 0:
             return
-
-        parsed_answer, raw_answer = self.__get_answer__(data, self.root_server_address)
-        self.cash.put(data, raw_answer, parsed_answer['body']['answer'][0]['ttl'])
-        self.server_socket.sendto(raw_answer, client)
-
-    def __get_answer__(self, request, target):
-        while True:
-            self.request_socket.sendto(request, target)
-            raw_response, server = self.request_socket.recvfrom(2048)
-            parsed_response = self.response_parser.parse_response(raw_response)
-            body = parsed_response['body']
-            if 'answer' in body:
-                break
-            if 'additional' in body:
-                for record in body['additional']:
-                    if record['type'] == 1:
-                        target = (record['data'], 53)
+        while self.queue.full():
+            record = self.queue.get()
+            if record.r and record.let > time.time():
+                record.r = False
+                self.queue.put(record)
             else:
-                target = (
-                    self.__get_answer__(
-                        self.request_generator.generate_request(body['authority'][0]['data'], 'A'),
-                        self.root_server_address)[0]['body']['answer'][0]['data'], 53)
-        return parsed_response, raw_response
+                self.records.pop(record.request)
+        record = CashRecord(request, response, ttl + time.time())
+        self.records[request] = record
+        self.queue.put(record)
+        self.lock.release()
 
-    def __shut_down__(self):
-        self.server_socket.close()
-        self.request_socket.close()
-        
+    def restore(self):
+        with open('cash.json', 'r+') as file:
+            data = file.read()
+            dict = json.loads(data)
+            for request in dict:
+                record = CashRecord(request, dict[request]['response'], dict[request]['let'])
+                record.r = dict[request]['r']
+                if record.let < time.time():
+                    continue
+                self.records[request] = record
+                self.queue.put(record)
+
+    def save(self):
+        dict = {}
+        for record in self.records:
+            dict[record] = self.records[record].to_dict()
+        with open('cash.json', 'w+') as file:
+            file.write(json.dumps(dict))
+
+    def __contains__(self, item):
+        if item not in self.records:
+            return False
+        if self.records[item].let < time.time():
+            self.records.pop(item)
+            return False
+        return True
+
 
 class DnsRequestGenerator:
     qtypes = {
@@ -207,77 +235,52 @@ class DnsResponseParser:
             return self.__parse_mx__(data, cursor, size)
 
 
-class CashRecord:
-    def __init__(self, request, response, let):
-        self.request = request
-        self.response = response
-        self.let = let
-        self.r = True
-
-    def to_dict(self):
-        return {'response': self.response, 'let': self.let, 'r': self.r}
+request_generator = DnsRequestGenerator()
+response_parser = DnsResponseParser()
+root_server_address = ('198.41.0.4', 53)
 
 
-class Cash:
-    def __init__(self, maxsize=100):
-        self.queue = Queue(maxsize=maxsize)
-        self.records = {}
-        self.lock = Lock()
-        try:
-            self.restore()
-        except FileNotFoundError:
-            pass
-        atexit.register(self.save)
+class ThreadingDnsServer(socketserver.ThreadingUDPServer):
+    def __init__(self, host, cash_size=0):
+        self.cash = Cash(cash_size)
+        super().__init__((host, 53), DnsRequestHandler)
 
-    def get(self, key):
-        self.lock.acquire()
-        if not key or key not in self.records:
-            return None
-        record = self.records[key]
-        record.r = True
-        self.lock.release()
-        return record.response
+    def finish_request(self, request, client_address) -> None:
+        self.RequestHandlerClass(request, client_address, self, self.cash)
 
-    def put(self, request, response, ttl):
-        self.lock.acquire()
-        if self.queue.maxsize == 0:
+
+class DnsRequestHandler(socketserver.DatagramRequestHandler):
+
+    def __init__(self, request, client_address, server, cash):
+        self.request_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.cash = cash
+        super().__init__(request, client_address, server)
+
+    def handle(self) -> None:
+        data = self.rfile.read(1024)
+        if data in self.cash:
+            self.wfile.write(self.cash.get(data))
             return
-        while self.queue.full():
-            record = self.queue.get()
-            if record.r and record.let > time.time():
-                record.r = False
-                self.queue.put(record)
+        parsed_answer, raw_answer = self.__get_answer__(data, root_server_address)
+        self.cash.put(data, raw_answer, parsed_answer['body']['answer'][0]['ttl'])
+        self.wfile.write(raw_answer)
+        self.request_socket.close()
+
+    def __get_answer__(self, request, target):
+        while True:
+            self.request_socket.sendto(request, target)
+            raw_response, server = self.request_socket.recvfrom(2048)
+            parsed_response = response_parser.parse_response(raw_response)
+            body = parsed_response['body']
+            if 'answer' in body:
+                break
+            if 'additional' in body:
+                for record in body['additional']:
+                    if record['type'] == 1:
+                        target = (record['data'], 53)
             else:
-                self.records.pop(record.request)
-        record = CashRecord(request, response, ttl + time.time())
-        self.records[request] = record
-        self.queue.put(record)
-        self.lock.release()
-
-    def restore(self):
-        with open('cash.json', 'r+') as file:
-            data = file.read()
-            dict = json.loads(data)
-            for request in dict:
-                record = CashRecord(request, dict[request]['response'], dict[request]['let'])
-                record.r = dict[request]['r']
-                if record.let < time.time():
-                    continue
-                self.records[request] = record
-                self.queue.put(record)
-
-    def save(self):
-        dict = {}
-        for record in self.records:
-            dict[record] = self.records[record].to_dict()
-
-        with open('cash.json', 'w+') as file:
-            file.write(json.dumps(dict))
-
-    def __contains__(self, item):
-        if item not in self.records:
-            return False
-        if self.records[item].let < time.time():
-            self.records.pop(item)
-            return False
-        return True
+                target = (
+                    self.__get_answer__(
+                        request_generator.generate_request(body['authority'][0]['data'], 'A'),
+                        root_server_address)[0]['body']['answer'][0]['data'], 53)
+        return parsed_response, raw_response
