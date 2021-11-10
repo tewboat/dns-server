@@ -128,7 +128,8 @@ class DnsResponseParser:
         1: 'A',
         28: 'AAAA',
         15: 'MX',
-        2: 'NS'
+        2: 'NS',
+        41: 'OPT'
     }
     flags = [('QR', 1), ('Opcode', 4), ('AA', 1), ('TC', 1),
              ('RD', 1), ('RA', 1), ('Z', 3), ('RCODE', 4)]
@@ -257,7 +258,7 @@ class DnsRequestHandler(socketserver.DatagramRequestHandler):
         super().__init__(request, client_address, server)
 
     def handle(self) -> None:
-        data = self.rfile.read(1024)
+        data = self.rfile.read(2048)
         if data in self.cash:
             self.wfile.write(self.cash.get(data))
             return
@@ -269,7 +270,7 @@ class DnsRequestHandler(socketserver.DatagramRequestHandler):
     def __get_answer__(self, request, target):
         while True:
             self.request_socket.sendto(request, target)
-            raw_response, server = self.request_socket.recvfrom(2048)
+            raw_response, server = self.request_socket.recvfrom(4096)
             parsed_response = response_parser.parse_response(raw_response)
             body = parsed_response['body']
             if 'answer' in body:
