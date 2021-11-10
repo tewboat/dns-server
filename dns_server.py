@@ -5,10 +5,8 @@ import random
 import socket
 import struct
 import time
-import socketserver
 from queue import Queue
 from threading import Thread, Lock
-
 
 
 class DnsServer:
@@ -24,10 +22,8 @@ class DnsServer:
         atexit.register(self.__shut_down__)
 
     def run(self):
-
         while True:
             data, address = self.server_socket.recvfrom(1024)
-            print(address)
             Thread(target=self.__handle_client__, args=(data, address)).start()
 
     def __handle_client__(self, data, client):
@@ -42,7 +38,7 @@ class DnsServer:
     def __get_answer__(self, request, target):
         while True:
             self.request_socket.sendto(request, target)
-            raw_response, server = self.request_socket.recvfrom(10000)
+            raw_response, server = self.request_socket.recvfrom(2048)
             parsed_response = self.response_parser.parse_response(raw_response)
             body = parsed_response['body']
             if 'answer' in body:
@@ -61,12 +57,7 @@ class DnsServer:
     def __shut_down__(self):
         self.server_socket.close()
         self.request_socket.close()
-
-
-class DnsRequestHandler(socketserver.DatagramRequestHandler):
-    def handle(self) -> None:
-        pass
-
+        
 
 class DnsRequestGenerator:
     qtypes = {
