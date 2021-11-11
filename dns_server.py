@@ -39,7 +39,7 @@ class Cash:
         record = self.records[key]
         record.r = True
         self.lock.release()
-        return record.response.decode()
+        return record.response.encode()
 
     def put(self, request: bytes, response: bytes, ttl: float):
         request = request.decode(errors='ignore')
@@ -57,6 +57,7 @@ class Cash:
         record = CashRecord(request, response, ttl + time.time())
         self.records[request] = record
         self.queue.put(record)
+        print(self.records)
         self.lock.release()
 
     def restore(self):
@@ -259,11 +260,13 @@ class DnsRequestHandler(socketserver.DatagramRequestHandler):
 
     def handle(self) -> None:
         data = self.rfile.read(2048)
-        if data in self.cash:
-            self.wfile.write(self.cash.get(data))
+        key = data[2:].decode(errors='ignore')
+        if key in self.cash:
+            print('cash')
+            self.wfile.write(data[:2] + self.cash.get(key))
             return
         parsed_answer, raw_answer = self.__get_answer__(data, root_server_address)
-        self.cash.put(data, raw_answer, parsed_answer['body']['answer'][0]['ttl'])
+        self.cash.put(data[2:], raw_answer[2:], parsed_answer['body']['answer'][0]['ttl'])
         self.wfile.write(raw_answer)
         self.request_socket.close()
 
