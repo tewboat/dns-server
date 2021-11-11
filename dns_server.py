@@ -254,17 +254,21 @@ class DnsRequestHandler(socketserver.DatagramRequestHandler):
 
     def __init__(self, request, client_address, server, cash):
         self.request_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.request_socket.settimeout(10)
         self.cash = cash
         super().__init__(request, client_address, server)
 
     def handle(self) -> None:
         data = self.rfile.read(2048)
-        print(data)
         key = data[2:].decode(errors='ignore')
         if key in self.cash:
             self.wfile.write(data[:2] + self.cash.get(key))
             return
-        parsed_answer, raw_answer = self.__get_answer__(data, root_server_address)
+        try:
+            parsed_answer, raw_answer = self.__get_answer__(data, root_server_address)
+        except socket.timeout:
+            self.request_socket.close()
+            return
         self.cash.put(data[2:], raw_answer[2:], parsed_answer['body']['answer'][0]['ttl'])
         self.wfile.write(raw_answer)
         self.request_socket.close()
@@ -281,6 +285,7 @@ class DnsRequestHandler(socketserver.DatagramRequestHandler):
                 for record in body['additional']:
                     if record['type'] == 1:
                         target = (record['data'], 53)
+                        break
             else:
                 target = (
                     self.__get_answer__(
