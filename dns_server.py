@@ -170,9 +170,11 @@ class DnsResponseParser:
         return result
 
     def __get_question_section__(self, data, cursor):
+        d = data[cursor:]
         section = {}
         section['name'], cursor = self.__read_name__(data, cursor)
         cursor += 1
+        n = data[cursor: cursor + 2]
         section['type'] = self.qtypes[struct.unpack('>H', data[cursor: cursor + 2])[0]]
         cursor += 2
         section['class'] = struct.unpack('>H', data[cursor: cursor + 2])[0]
@@ -238,6 +240,22 @@ class DnsResponseParser:
 
 request_generator = DnsRequestGenerator()
 response_parser = DnsResponseParser()
+root_server_addresses = [
+    ('198.41.0.4', 53),
+    ('199.9.14.201', 53),
+    ('192.33.4.12', 53),
+    ('199.7.91.13', 53),
+    ('192.203.230.10', 53),
+    ('192.5.5.241', 53),
+    ('192.112.36.4', 53),
+    ('198.97.190.53', 53),
+    ('192.36.148.17', 53),
+    ('192.58.128.30', 53),
+    ('193.0.14.129', 53),
+    ('199.7.83.42', 53),
+    ('202.12.27.33', 53)
+]
+
 root_server_address = ('198.41.0.4', 53)
 
 
@@ -264,11 +282,14 @@ class DnsRequestHandler(socketserver.DatagramRequestHandler):
         if key in self.cash:
             self.wfile.write(data[:2] + self.cash.get(key))
             return
-        try:
-            parsed_answer, raw_answer = self.__get_answer__(data, root_server_address)
-        except socket.timeout:
-            self.request_socket.close()
-            return
+        for i in range(len(root_server_addresses)):
+            try:
+                parsed_answer, raw_answer = self.__get_answer__(data, root_server_addresses[i])
+                break
+            except socket.timeout:
+                if i == len(root_server_addresses) - 1:
+                    self.request_socket.close()
+                    return
         self.cash.put(data[2:], raw_answer[2:], parsed_answer['body']['answer'][0]['ttl'])
         self.wfile.write(raw_answer)
         self.request_socket.close()
